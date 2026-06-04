@@ -55,6 +55,27 @@
   <div class="dashboard-columns" id="dashboardColumns">
 
     <!-- LEFT COLUMN: Open tabs -->
+    <div class="active-section-wrap">
+
+    <!-- STALE TABS: tabs you haven't looked at in a while -->
+    <div class="stale-section" id="staleSection" style="display:none">
+      <!-- Collapsed toggle row — always visible when there are stale tabs.
+           Clicking it expands/collapses the body. Built by renderStaleSection(). -->
+      <button class="stale-toggle" id="staleToggle" data-action="toggle-stale">
+        <svg class="stale-chevron" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m8.25 4.5 7.5 7.5-7.5 7.5" /></svg>
+        <span class="stale-toggle-icon" aria-hidden="true">&#9888;</span>
+        <span class="stale-toggle-text" id="staleToggleText"></span>
+      </button>
+
+      <!-- Collapsible body — hidden by default -->
+      <div class="stale-body" id="staleBody" style="display:none">
+        <!-- Threshold toggle chips + "close all" — injected by renderStaleSection() -->
+        <div class="stale-controls" id="staleControls"></div>
+        <!-- Stale tab chips — injected by renderStaleSection() -->
+        <div class="stale-tabs" id="staleTabs"></div>
+      </div>
+    </div>
+
     <div class="active-section" id="openTabsSection" style="display:none">
       <div class="section-header">
         <h2 id="openTabsSectionTitle">Right now</h2>
@@ -63,6 +84,8 @@
       </div>
       <div class="missions" id="openTabsMissions"></div>
     </div>
+
+    </div><!-- end .active-section-wrap -->
 
     <!-- RIGHT COLUMN: Saved for Later checklist -->
     <div class="deferred-column" id="deferredColumn" style="display:none">
@@ -127,7 +150,7 @@
 
 <!-- Personal config (gitignored) — defines LOCAL_LANDING_PAGE_PATTERNS etc. -->
 <!-- If the file doesn't exist, that's fine — app.js uses sensible defaults. -->
-<script src="config.local.js" onerror="/* no personal config, that's fine */"></script>
+<script src="config.local.js"></script>
 
 <!-- Main dashboard logic — loads last so the DOM is ready -->
 <script src="app.js"></script>

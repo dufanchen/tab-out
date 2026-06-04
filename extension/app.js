@@ -26,6 +26,32 @@
 // All open tabs — populated by fetchOpenTabs()
 let openTabs = [];
 
+/* ----------------------------------------------------------------
+   STALE TABS — "long-unviewed" tracking
+
+   background.js stamps each tab's last-viewed time into
+   chrome.storage.local under this key. The dashboard reads it to
+   surface tabs you haven't looked at in a while.
+   ---------------------------------------------------------------- */
+
+// Storage key shared with background.js — must stay in sync
+const STALE_LAST_ACCESSED_KEY = 'tabLastAccessed';
+// Storage key for the user's chosen "stale" threshold (in milliseconds)
+const STALE_THRESHOLD_KEY = 'staleThresholdMs';
+
+// Preset threshold options shown as toggle chips. value = milliseconds.
+const STALE_THRESHOLD_PRESETS = [
+  { label: '1 hour', value: 60 * 60 * 1000 },
+  { label: '1 day',  value: 24 * 60 * 60 * 1000 },
+  { label: '3 days', value: 3 * 24 * 60 * 60 * 1000 },
+];
+
+// Default: tabs untouched for 3 days are considered stale
+const DEFAULT_STALE_THRESHOLD = 3 * 24 * 60 * 60 * 1000;
+
+// Whether the stale group is expanded. Default collapsed — it's a quiet nudge.
+let staleSectionExpanded = false;
+
 /**
  * fetchOpenTabs()
  *
@@ -39,12 +65,24 @@ async function fetchOpenTabs() {
     const newtabUrl = `chrome-extension://${extensionId}/index.html`;
 
     const tabs = await chrome.tabs.query({});
+
+    // Read our durable "last viewed" map (written by background.js). Fall back
+    // to Chrome's native tab.lastAccessed if we don't have a record yet.
+    let accessMap = {};
+    try {
+      const stored = await chrome.storage.local.get(STALE_LAST_ACCESSED_KEY);
+      accessMap = stored[STALE_LAST_ACCESSED_KEY] || {};
+    } catch { accessMap = {}; }
+
     openTabs = tabs.map(t => ({
       id:       t.id,
       url:      t.url,
       title:    t.title,
       windowId: t.windowId,
       active:   t.active,
+      // When this tab was last viewed (ms epoch). Prefer our own record;
+      // fall back to Chrome's native value or "now" for brand-new tabs.
+      lastAccessed: accessMap[t.id] || t.lastAccessed || Date.now(),
       // Flag Tab Out's own pages so we can detect duplicate new tabs
       isTabOut: t.url === newtabUrl || t.url === 'chrome://newtab/',
     }));
@@ -732,6 +770,68 @@ function getRealTabs() {
   });
 }
 
+/* ----------------------------------------------------------------
+   STALE TAB HELPERS
+   ---------------------------------------------------------------- */
+
+/**
+ * getStaleThreshold()
+ *
+ * Returns the user's chosen "long-unviewed" threshold in ms,
+ * falling back to the default if none has been saved yet.
+ */
+async function getStaleThreshold() {
+  try {
+    const stored = await chrome.storage.local.get(STALE_THRESHOLD_KEY);
+    const value = stored[STALE_THRESHOLD_KEY];
+    return typeof value === 'number' && value > 0 ? value : DEFAULT_STALE_THRESHOLD;
+  } catch {
+    return DEFAULT_STALE_THRESHOLD;
+  }
+}
+
+/**
+ * setStaleThreshold(ms)
+ *
+ * Persists the user's chosen threshold.
+ */
+async function setStaleThreshold(ms) {
+  try {
+    await chrome.storage.local.set({ [STALE_THRESHOLD_KEY]: ms });
+  } catch {
+    // Non-fatal — selection just won't persist across reloads
+  }
+}
+
+/**
+ * getStaleTabs(thresholdMs)
+ *
+ * Returns real web tabs that haven't been viewed for at least thresholdMs,
+ * excluding the currently active tab and Tab Out's own pages. Sorted oldest
+ * first so the most-neglected tabs surface at the top.
+ */
+function getStaleTabs(thresholdMs) {
+  const now = Date.now();
+  return getRealTabs()
+    .filter(t => !t.active && !t.isTabOut)
+    .filter(t => now - (t.lastAccessed || now) >= thresholdMs)
+    .sort((a, b) => (a.lastAccessed || 0) - (b.lastAccessed || 0));
+}
+
+/**
+ * formatAge(ms)
+ *
+ * Turns an elapsed duration into a short human label like "3h" or "2d".
+ */
+function formatAge(ms) {
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 60) return `${Math.max(1, minutes)}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  return `${days}d`;
+}
+
 /**
  * checkTabOutDupes()
  *
@@ -1003,6 +1103,85 @@ function renderArchiveItem(item) {
     </div>`;
 }
 
+/* ----------------------------------------------------------------
+   STALE TABS SECTION RENDERING
+   ---------------------------------------------------------------- */
+
+/**
+ * renderStaleSection()
+ *
+ * Renders the "Haven't looked at these" group: threshold toggle chips,
+ * a "close all" button, and one chip per stale tab. Hidden entirely when
+ * there are no stale tabs for the current threshold.
+ */
+async function renderStaleSection() {
+  const section    = document.getElementById('staleSection');
+  const controlsEl = document.getElementById('staleControls');
+  const tabsEl     = document.getElementById('staleTabs');
+  const bodyEl     = document.getElementById('staleBody');
+  const toggleEl   = document.getElementById('staleToggle');
+  const toggleText = document.getElementById('staleToggleText');
+  if (!section || !controlsEl || !tabsEl || !bodyEl || !toggleEl) return;
+
+  const threshold = await getStaleThreshold();
+  const staleTabs = getStaleTabs(threshold);
+
+  // Threshold chips are always rendered so the user can switch even when the
+  // current threshold yields no stale tabs — but the section only shows if
+  // there's at least one stale tab OR the user has tabs that could go stale.
+  const chipsHtml = STALE_THRESHOLD_PRESETS.map(preset => {
+    const isActive = preset.value === threshold;
+    return `<button class="stale-chip${isActive ? ' active' : ''}" data-action="set-stale-threshold" data-threshold="${preset.value}">${preset.label}</button>`;
+  }).join('');
+
+  if (staleTabs.length === 0) {
+    // No stale tabs at this threshold — hide the whole section to stay clean
+    section.style.display = 'none';
+    return;
+  }
+
+  const now = Date.now();
+  const tabsHtml = staleTabs.map(tab => {
+    const label     = tab.title || tab.url || 'Untitled';
+    const safeUrl   = (tab.url || '').replace(/"/g, '&quot;');
+    const safeTitle = label.replace(/"/g, '&quot;');
+    const age       = formatAge(now - (tab.lastAccessed || now));
+    let domain = '';
+    try { domain = new URL(tab.url).hostname; } catch {}
+    const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=16` : '';
+    return `<div class="page-chip stale-chip-tab clickable" data-action="focus-tab" data-tab-url="${safeUrl}" title="${safeTitle}">
+      ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
+      <span class="chip-text">${label}</span>
+      <span class="stale-age" title="Last viewed ${age} ago">${age}</span>
+      <div class="chip-actions">
+        <button class="chip-action chip-close" data-action="close-stale-tab" data-tab-url="${safeUrl}" title="Close this tab">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
+        </button>
+      </div>
+    </div>`;
+  }).join('');
+
+  controlsEl.innerHTML = `
+    <div class="stale-chips">${chipsHtml}</div>
+    <button class="action-btn close-tabs stale-close-all" data-action="close-all-stale-tabs" title="Close every tab in this list">
+      ${ICONS.close} Close all ${staleTabs.length}
+    </button>`;
+  tabsEl.innerHTML = tabsHtml;
+
+  // Collapsed toggle row: a one-line summary. Body stays hidden until clicked.
+  const count = staleTabs.length;
+  if (toggleText) {
+    toggleText.textContent = `${count} tab${count !== 1 ? 's' : ''} you haven't looked at`;
+  }
+
+  // Preserve expand state across re-renders (default: collapsed)
+  const isExpanded = staleSectionExpanded;
+  bodyEl.style.display = isExpanded ? 'block' : 'none';
+  toggleEl.classList.toggle('open', isExpanded);
+
+  section.style.display = 'block';
+}
+
 
 /* ----------------------------------------------------------------
    MAIN DASHBOARD RENDERER
@@ -1164,6 +1343,9 @@ async function renderStaticDashboard() {
   // --- Check for duplicate Tab Out tabs ---
   checkTabOutDupes();
 
+  // --- Render "Haven't looked at these" (stale tabs) group ---
+  await renderStaleSection();
+
   // --- Render "Saved for Later" column ---
   await renderDeferredColumn();
 }
@@ -1199,6 +1381,77 @@ document.addEventListener('click', async (e) => {
       setTimeout(() => { banner.style.display = 'none'; banner.style.opacity = '1'; }, 400);
     }
     showToast('Closed extra Tab Out tabs');
+    return;
+  }
+
+  // ---- Expand/collapse the stale group ----
+  if (action === 'toggle-stale') {
+    staleSectionExpanded = !staleSectionExpanded;
+    const bodyEl   = document.getElementById('staleBody');
+    const toggleEl = document.getElementById('staleToggle');
+    if (bodyEl)   bodyEl.style.display = staleSectionExpanded ? 'block' : 'none';
+    if (toggleEl) toggleEl.classList.toggle('open', staleSectionExpanded);
+    return;
+  }
+
+  // ---- Switch the "stale" threshold (1 hour / 1 day / 3 days) ----
+  if (action === 'set-stale-threshold') {
+    const ms = parseInt(actionEl.dataset.threshold, 10);
+    if (!Number.isNaN(ms)) {
+      await setStaleThreshold(ms);
+      await renderStaleSection();
+    }
+    return;
+  }
+
+  // ---- Close a single stale tab ----
+  if (action === 'close-stale-tab') {
+    e.stopPropagation(); // don't trigger parent chip's focus-tab
+    const tabUrl = actionEl.dataset.tabUrl;
+    if (!tabUrl) return;
+
+    await closeTabsExact([tabUrl]);
+    playCloseSound();
+
+    const chip = actionEl.closest('.page-chip');
+    if (chip) {
+      const rect = chip.getBoundingClientRect();
+      shootConfetti(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      chip.style.transition = 'opacity 0.2s, transform 0.2s';
+      chip.style.opacity    = '0';
+      chip.style.transform  = 'scale(0.8)';
+      setTimeout(() => { chip.remove(); renderStaleSection(); }, 200);
+    }
+
+    const statTabs = document.getElementById('statTabs');
+    if (statTabs) statTabs.textContent = openTabs.length;
+    showToast('Tab closed');
+    return;
+  }
+
+  // ---- Close ALL stale tabs in the list (the one-click feature) ----
+  if (action === 'close-all-stale-tabs') {
+    const threshold = await getStaleThreshold();
+    const staleTabs = getStaleTabs(threshold);
+    const urls = staleTabs.map(t => t.url).filter(Boolean);
+    if (urls.length === 0) return;
+
+    // Confetti from each stale chip before they go
+    document.querySelectorAll('#staleTabs .page-chip').forEach(c => {
+      const rect = c.getBoundingClientRect();
+      shootConfetti(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    });
+
+    await closeTabsExact(urls);
+    playCloseSound();
+
+    showToast(`Closed ${urls.length} unviewed tab${urls.length !== 1 ? 's' : ''}`);
+
+    const statTabs = document.getElementById('statTabs');
+    if (statTabs) statTabs.textContent = openTabs.length;
+
+    // Re-render the whole dashboard so domain cards stay accurate too
+    await renderStaticDashboard();
     return;
   }
 

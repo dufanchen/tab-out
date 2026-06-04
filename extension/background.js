@@ -60,34 +60,114 @@ async function updateBadge() {
   }
 }
 
+// ─── Last-accessed tracking ─────────────────────────────────────────────────
+//
+// Chrome's native tab.lastAccessed resets on browser restart, so we keep our
+// own durable record of when each tab was last viewed. We store a simple
+// { [tabId]: timestamp } map in chrome.storage.local under STORAGE_KEY.
+// The dashboard (app.js) reads this map to surface "stale" (long-unviewed) tabs.
+
+const LAST_ACCESSED_KEY = 'tabLastAccessed';
+
+/**
+ * recordTabAccess(tabId)
+ *
+ * Stamps the given tab with the current time as its "last viewed" moment.
+ */
+async function recordTabAccess(tabId) {
+  if (typeof tabId !== 'number') return;
+  try {
+    const stored = await chrome.storage.local.get(LAST_ACCESSED_KEY);
+    const accessMap = stored[LAST_ACCESSED_KEY] || {};
+    accessMap[tabId] = Date.now();
+    await chrome.storage.local.set({ [LAST_ACCESSED_KEY]: accessMap });
+  } catch {
+    // Storage failures are non-fatal — we simply lose this one timestamp
+  }
+}
+
+/**
+ * forgetTab(tabId)
+ *
+ * Removes a closed tab's timestamp so the map doesn't grow forever.
+ */
+async function forgetTab(tabId) {
+  try {
+    const stored = await chrome.storage.local.get(LAST_ACCESSED_KEY);
+    const accessMap = stored[LAST_ACCESSED_KEY] || {};
+    if (accessMap[tabId] !== undefined) {
+      delete accessMap[tabId];
+      await chrome.storage.local.set({ [LAST_ACCESSED_KEY]: accessMap });
+    }
+  } catch {
+    // Non-fatal
+  }
+}
+
+/**
+ * seedTimestampsForExistingTabs()
+ *
+ * On install/startup, give every already-open tab a baseline timestamp so the
+ * dashboard has data to work with immediately instead of waiting for the user
+ * to manually switch to each tab.
+ */
+async function seedTimestampsForExistingTabs() {
+  try {
+    const tabs = await chrome.tabs.query({});
+    const stored = await chrome.storage.local.get(LAST_ACCESSED_KEY);
+    const accessMap = stored[LAST_ACCESSED_KEY] || {};
+    const now = Date.now();
+    for (const tab of tabs) {
+      // The active tab in each window counts as "just viewed"; others get a
+      // baseline of now too, so the stale clock starts ticking from install.
+      if (accessMap[tab.id] === undefined) accessMap[tab.id] = now;
+    }
+    await chrome.storage.local.set({ [LAST_ACCESSED_KEY]: accessMap });
+  } catch {
+    // Non-fatal
+  }
+}
+
 // ─── Event listeners ──────────────────────────────────────────────────────────
 
 // Update badge when the extension is first installed
 chrome.runtime.onInstalled.addListener(() => {
   updateBadge();
+  seedTimestampsForExistingTabs();
 });
 
 // Update badge when Chrome starts up
 chrome.runtime.onStartup.addListener(() => {
   updateBadge();
+  seedTimestampsForExistingTabs();
 });
 
 // Update badge whenever a tab is opened
-chrome.tabs.onCreated.addListener(() => {
+chrome.tabs.onCreated.addListener((tab) => {
   updateBadge();
+  recordTabAccess(tab.id);
 });
 
 // Update badge whenever a tab is closed
-chrome.tabs.onRemoved.addListener(() => {
+chrome.tabs.onRemoved.addListener((tabId) => {
   updateBadge();
+  forgetTab(tabId);
 });
 
 // Update badge when a tab's URL changes (e.g. navigating to/from chrome://)
-chrome.tabs.onUpdated.addListener(() => {
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   updateBadge();
+  // Navigating to a new page within a tab counts as viewing it
+  if (changeInfo.url) recordTabAccess(tabId);
+});
+
+// Stamp the tab the user just switched to — this is the core "last viewed" signal
+chrome.tabs.onActivated.addListener((activeInfo) => {
+  recordTabAccess(activeInfo.tabId);
 });
 
 // ─── Initial run ─────────────────────────────────────────────────────────────
 
 // Run once immediately when the service worker first loads
 updateBadge();
+seedTimestampsForExistingTabs();

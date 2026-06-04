@@ -26,6 +26,7 @@ The agent will walk you through it. Takes about 1 minute.
 - **Homepages group** pulls Gmail inbox, X home, YouTube, LinkedIn, GitHub homepages into one card
 - **Close tabs with style** with swoosh sound + confetti burst
 - **Duplicate detection** flags when you have the same page open twice, with one-click cleanup
+- **Close stale tabs in one click** surfaces tabs you haven't looked at in a while (1 hour / 1 day / 3 days, default 3 days) in a collapsible group, and closes them all with one button
 - **Click any tab to jump to it** across windows, no new tab opened
 - **Save for later** bookmark tabs to a checklist before closing them
 - **Localhost grouping** shows port numbers next to each tab so you can tell your vibe coding projects apart
@@ -64,10 +65,11 @@ You open a new tab
   -> Homepages (Gmail, X, etc.) get their own group at the top
   -> Click any tab title to jump to it
   -> Close groups you're done with (swoosh + confetti)
+  -> Expand "Haven't looked at these" to clear tabs gone stale (1h / 1d / 3d)
   -> Save tabs for later before closing them
 ```
 
-Everything runs inside the Chrome extension. No external server, no API calls, no data sent anywhere. Saved tabs are stored in `chrome.storage.local`.
+Everything runs inside the Chrome extension. No external server, no API calls, no data sent anywhere. Saved tabs and your last-viewed timestamps are stored in `chrome.storage.local`.
 
 ---
 

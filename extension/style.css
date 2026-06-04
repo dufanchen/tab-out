@@ -1156,3 +1156,135 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
   opacity: 0.6;
   flex-shrink: 0;
 }
+
+/* ============================================================
+   STALE TABS — "Haven't looked at these" group
+   ============================================================ */
+
+.stale-section {
+  margin-bottom: 32px;
+}
+
+/* Collapsed toggle row — the quiet one-line nudge */
+.stale-toggle {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  text-align: left;
+  background: rgba(200, 113, 58, 0.06);
+  border: 1px solid rgba(200, 113, 58, 0.2);
+  border-radius: 10px;
+  padding: 11px 16px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink);
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.stale-toggle:hover {
+  background: rgba(200, 113, 58, 0.1);
+  border-color: rgba(200, 113, 58, 0.35);
+}
+
+.stale-toggle-icon {
+  color: var(--accent-amber);
+  font-size: 14px;
+  line-height: 1;
+}
+
+.stale-toggle-text {
+  flex: 1;
+}
+
+/* Chevron rotates from ">" to "v" when expanded */
+.stale-chevron {
+  width: 14px;
+  height: 14px;
+  color: var(--muted);
+  transition: transform 0.2s;
+  flex-shrink: 0;
+}
+
+.stale-toggle.open .stale-chevron {
+  transform: rotate(90deg);
+}
+
+/* Collapsible body sits just under the toggle */
+.stale-body {
+  margin-top: 14px;
+}
+
+/* Controls row: threshold chips on the left, "close all" on the right */
+.stale-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+
+.stale-chips {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Each threshold toggle (30 min / 1 hour / 1 day) */
+.stale-chip {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 4px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--warm-gray);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.stale-chip:hover {
+  border-color: var(--accent-amber);
+  color: var(--accent-amber);
+}
+
+.stale-chip.active {
+  background: var(--accent-amber);
+  border-color: var(--accent-amber);
+  color: #fff;
+}
+
+/* "Close all N" button reuses .action-btn look but stays compact */
+.stale-close-all {
+  font-size: 11px;
+  padding: 4px 12px;
+}
+
+/* Stale tab rows live in a card-like container */
+.stale-tabs {
+  background: var(--card-bg);
+  border: 1px solid var(--warm-gray);
+  border-radius: 10px;
+  padding: 6px 14px;
+  box-shadow: 0 1px 6px var(--shadow);
+}
+
+/* Each stale tab row reuses .page-chip; we add the age badge */
+.stale-chip-tab .stale-age {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent-amber);
+  background: rgba(200, 113, 58, 0.1);
+  padding: 2px 7px;
+  border-radius: 10px;
+  flex-shrink: 0;
+  margin-left: 8px;
+}
+
+/* Keep the close button discoverable but quiet, matching other chips */
+.stale-chip-tab .chip-actions {
+  margin-left: 8px;
+}
