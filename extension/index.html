@@ -26,6 +26,13 @@
       <!-- "Friday, April 4, 2026" — written by getDateDisplay() in app.js -->
       <div class="date" id="dateDisplay"></div>
     </div>
+
+    <!-- VIEW TOGGLE — switch between grouping by domain vs by scene (open order).
+         app.js wires up the buttons and keeps the active state in sync. -->
+    <div class="view-toggle" id="viewToggle" role="group" aria-label="Group tabs by">
+      <button class="view-toggle-btn" data-action="set-view-mode" data-view-mode="domain">By domain</button>
+      <button class="view-toggle-btn" data-action="set-view-mode" data-view-mode="scene">By scene</button>
+    </div>
   </header>
 
   <!-- ================================================================

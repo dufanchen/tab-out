@@ -69,6 +69,68 @@ async function updateBadge() {
 
 const LAST_ACCESSED_KEY = 'tabLastAccessed';
 
+// ─── Opener (parent → child) tracking ───────────────────────────────────────
+//
+// To organize tabs by "scene" (the chain of tabs you opened from one another)
+// instead of by domain, we need to know which tab spawned which. Chrome gives
+// us tab.openerTabId, but ONLY at creation time — it's gone once the tab is
+// closed or the browser restarts. So we persist a durable map of
+// { [childTabId]: openerTabId } in chrome.storage.local under this key.
+// The dashboard (app.js) reads this map to rebuild the open-order tree.
+const OPENER_MAP_KEY = 'tabOpenerMap';
+
+/**
+ * recordTabOpener(tab)
+ *
+ * Remembers which tab opened the given tab, so the dashboard can later
+ * reconstruct the "opened from" tree. Tabs with no opener (e.g. typed URLs,
+ * restored sessions) simply get no entry and show up as their own roots.
+ */
+async function recordTabOpener(tab) {
+  if (!tab || typeof tab.id !== 'number') return;
+  if (typeof tab.openerTabId !== 'number') return;
+  try {
+    const stored = await chrome.storage.local.get(OPENER_MAP_KEY);
+    const openerMap = stored[OPENER_MAP_KEY] || {};
+    openerMap[tab.id] = tab.openerTabId;
+    await chrome.storage.local.set({ [OPENER_MAP_KEY]: openerMap });
+  } catch {
+    // Non-fatal — we just lose this one relationship
+  }
+}
+
+/**
+ * forgetTabOpener(tabId)
+ *
+ * Cleans up a closed tab's opener record. Also re-parents any children that
+ * pointed at this tab onto this tab's own opener (its grandparent), so a
+ * closed middle tab doesn't orphan a whole branch.
+ */
+async function forgetTabOpener(tabId) {
+  try {
+    const stored = await chrome.storage.local.get(OPENER_MAP_KEY);
+    const openerMap = stored[OPENER_MAP_KEY] || {};
+
+    const grandparentId = openerMap[tabId];
+
+    // Re-parent children of the closed tab onto its grandparent (if any)
+    for (const childId of Object.keys(openerMap)) {
+      if (openerMap[childId] === tabId) {
+        if (typeof grandparentId === 'number') {
+          openerMap[childId] = grandparentId;
+        } else {
+          delete openerMap[childId];
+        }
+      }
+    }
+
+    delete openerMap[tabId];
+    await chrome.storage.local.set({ [OPENER_MAP_KEY]: openerMap });
+  } catch {
+    // Non-fatal
+  }
+}
+
 /**
  * recordTabAccess(tabId)
  *
@@ -146,12 +208,16 @@ chrome.runtime.onStartup.addListener(() => {
 chrome.tabs.onCreated.addListener((tab) => {
   updateBadge();
   recordTabAccess(tab.id);
+  // Remember which tab spawned this one, for the "by scene" tree view
+  recordTabOpener(tab);
 });
 
 // Update badge whenever a tab is closed
 chrome.tabs.onRemoved.addListener((tabId) => {
   updateBadge();
   forgetTab(tabId);
+  // Clean up the opener record and re-parent any orphaned children
+  forgetTabOpener(tabId);
 });
 
 // Update badge when a tab's URL changes (e.g. navigating to/from chrome://)

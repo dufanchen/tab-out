@@ -43,7 +43,7 @@ body::before {
 .container {
   position: relative;
   z-index: 1;
-  max-width: 960px;
+  max-width: 1500px;
   margin: 0 auto;
   padding: 48px 32px 80px;
 }
@@ -51,7 +51,7 @@ body::before {
 /* When the saved-for-later sidebar is open, expand the container
    so the tab grid still has room for 2-3 columns */
 .container:has(.dashboard-columns) {
-  max-width: 1300px;
+  max-width: 1500px;
 }
 
 /* ---- Header ---- */
@@ -1287,4 +1287,131 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
 /* Keep the close button discoverable but quiet, matching other chips */
 .stale-chip-tab .chip-actions {
   margin-left: 8px;
+}
+
+
+/* ================================================================
+   VIEW TOGGLE — "By domain" / "By scene" switch in the header
+   A compact segmented control. The active segment fills with the warm
+   card background to read as "selected" against the paper backdrop.
+   ================================================================ */
+
+.view-toggle {
+  display: inline-flex;
+  background: var(--warm-gray);
+  border-radius: 8px;
+  padding: 3px;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.view-toggle-btn {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 14px;
+  cursor: pointer;
+  letter-spacing: 0.2px;
+  white-space: nowrap;
+  transition: background 0.18s, color 0.18s, box-shadow 0.18s;
+}
+
+.view-toggle-btn:hover {
+  color: var(--ink);
+}
+
+.view-toggle-btn.active {
+  background: var(--card-bg);
+  color: var(--ink);
+  box-shadow: 0 1px 3px var(--shadow);
+}
+
+
+/* ================================================================
+   SCENE VIEW — tree of tabs grouped by how they were opened
+
+   Each scene is a .scene-card (reusing .mission-card chrome). Inside,
+   .scene-tree holds nested .scene-row elements, each indented by its
+   depth via the --depth custom property. A thin guide line + a small
+   branch connector make the parent → child relationship readable.
+   ================================================================ */
+
+.scene-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin-bottom: 8px;
+}
+
+/* One row = one tab. Indent grows with depth (16px per level). */
+.scene-row {
+  position: relative;
+  padding-left: calc(var(--depth, 0) * 16px);
+}
+
+/* Vertical guide line for nested rows, so the tree reads top-to-bottom */
+.scene-row:not(.depth-0)::before {
+  content: '';
+  position: absolute;
+  left: calc((var(--depth, 1) - 1) * 16px + 7px);
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--warm-gray);
+}
+
+/* The little horizontal connector from the guide line into the row */
+.scene-branch {
+  display: inline-block;
+  width: 10px;
+  height: 1px;
+  background: var(--warm-gray);
+  margin-right: 4px;
+  flex-shrink: 0;
+}
+
+/* The clickable node reuses .page-chip styling; just ensure it fills the row */
+.scene-node {
+  width: 100%;
+}
+
+/* Small pill showing how many descendants hang off a parent node */
+.scene-child-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 5px;
+  margin-left: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent-sage);
+  background: rgba(90, 122, 98, 0.12);
+  border-radius: 10px;
+  flex-shrink: 0;
+}
+
+/* "Close whole subtree" action — tinted rose so it's distinct from the
+   single-tab close, signalling a bigger, more destructive action. */
+.scene-close-tree:hover svg {
+  color: var(--accent-rose);
+}
+
+/* The scene root name gets a touch more presence than child rows */
+.scene-card .mission-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 80%;
+}
+
+/* Uncategorized fallback card reads a little quieter than real scenes */
+.uncategorized-card .mission-name {
+  color: var(--muted);
+  font-style: italic;
 }

@@ -52,6 +52,76 @@ const DEFAULT_STALE_THRESHOLD = 3 * 24 * 60 * 60 * 1000;
 // Whether the stale group is expanded. Default collapsed — it's a quiet nudge.
 let staleSectionExpanded = false;
 
+/* ----------------------------------------------------------------
+   VIEW MODE — "by domain" vs "by scene" (open-order tree)
+
+   The dashboard can organize open tabs two ways:
+   - 'domain' : the classic grid, grouped by website hostname
+   - 'scene'  : a tree grouped by which tab opened which, so a chain of
+                tabs you opened while working on one thing stays together
+                regardless of domain.
+
+   The user's choice is persisted in chrome.storage.local so it sticks
+   across new-tab pages and browser restarts.
+   ---------------------------------------------------------------- */
+
+// Storage key for the user's chosen view mode
+const VIEW_MODE_KEY = 'tabViewMode';
+// Storage key shared with background.js — must stay in sync with OPENER_MAP_KEY there
+const OPENER_MAP_KEY = 'tabOpenerMap';
+
+const VIEW_MODE_DOMAIN = 'domain';
+const VIEW_MODE_SCENE = 'scene';
+
+// Current view mode, hydrated from storage on load. Default: classic by-domain.
+let currentViewMode = VIEW_MODE_DOMAIN;
+
+// In-memory copy of the { [childTabId]: openerTabId } map written by background.js
+let openerMap = {};
+
+/**
+ * getViewMode()
+ *
+ * Reads the persisted view mode, falling back to the classic domain view.
+ */
+async function getViewMode() {
+  try {
+    const stored = await chrome.storage.local.get(VIEW_MODE_KEY);
+    const mode = stored[VIEW_MODE_KEY];
+    return mode === VIEW_MODE_SCENE ? VIEW_MODE_SCENE : VIEW_MODE_DOMAIN;
+  } catch {
+    return VIEW_MODE_DOMAIN;
+  }
+}
+
+/**
+ * setViewMode(mode)
+ *
+ * Persists the chosen view mode so it survives reloads and restarts.
+ */
+async function setViewMode(mode) {
+  currentViewMode = mode === VIEW_MODE_SCENE ? VIEW_MODE_SCENE : VIEW_MODE_DOMAIN;
+  try {
+    await chrome.storage.local.set({ [VIEW_MODE_KEY]: currentViewMode });
+  } catch {
+    // Non-fatal — the in-memory value still drives this session
+  }
+}
+
+/**
+ * syncViewToggle()
+ *
+ * Reflects the current view mode in the header toggle buttons by marking the
+ * active one. Safe to call even if the toggle isn't in the DOM yet.
+ */
+function syncViewToggle() {
+  const buttons = document.querySelectorAll('#viewToggle .view-toggle-btn');
+  buttons.forEach(btn => {
+    const isActive = btn.dataset.viewMode === currentViewMode;
+    btn.classList.toggle('active', isActive);
+  });
+}
+
 /**
  * fetchOpenTabs()
  *
@@ -74,12 +144,22 @@ async function fetchOpenTabs() {
       accessMap = stored[STALE_LAST_ACCESSED_KEY] || {};
     } catch { accessMap = {}; }
 
+    // Read the durable opener map (written by background.js) so we can rebuild
+    // the "opened from" tree for the scene view.
+    try {
+      const storedOpeners = await chrome.storage.local.get(OPENER_MAP_KEY);
+      openerMap = storedOpeners[OPENER_MAP_KEY] || {};
+    } catch { openerMap = {}; }
+
     openTabs = tabs.map(t => ({
       id:       t.id,
       url:      t.url,
       title:    t.title,
       windowId: t.windowId,
       active:   t.active,
+      // Which tab spawned this one. Prefer Chrome's live value (only present at
+      // creation), then fall back to our persisted record. undefined = a root.
+      openerTabId: typeof t.openerTabId === 'number' ? t.openerTabId : openerMap[t.id],
       // When this tab was last viewed (ms epoch). Prefer our own record;
       // fall back to Chrome's native value or "now" for brand-new tabs.
       lastAccessed: accessMap[t.id] || t.lastAccessed || Date.now(),
@@ -145,6 +225,42 @@ async function closeTabsExact(urls) {
   const toClose = allTabs.filter(t => urlSet.has(t.url)).map(t => t.id);
   if (toClose.length > 0) await chrome.tabs.remove(toClose);
   await fetchOpenTabs();
+}
+
+/**
+ * closeTabsByIds(tabIds)
+ *
+ * Closes tabs by their exact Chrome tab id. Used by the scene tree view,
+ * where two tabs can share the same URL but are distinct nodes — so we must
+ * target the precise tab rather than matching on URL.
+ */
+async function closeTabsByIds(tabIds) {
+  if (!tabIds || tabIds.length === 0) return;
+  const validIds = tabIds.filter(id => typeof id === 'number');
+  if (validIds.length === 0) return;
+  try {
+    await chrome.tabs.remove(validIds);
+  } catch {
+    // Some ids may already be gone — ignore and resync below
+  }
+  await fetchOpenTabs();
+}
+
+/**
+ * focusTabById(tabId)
+ *
+ * Switches Chrome to a specific tab by its id and brings its window forward.
+ * Preferred in the scene view since URLs may be ambiguous across nodes.
+ */
+async function focusTabById(tabId) {
+  if (typeof tabId !== 'number') return;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    await chrome.tabs.update(tabId, { active: true });
+    await chrome.windows.update(tab.windowId, { focused: true });
+  } catch {
+    // Tab no longer exists — nothing to focus
+  }
 }
 
 /**
@@ -998,6 +1114,316 @@ function renderDomainCard(group) {
 
 
 /* ----------------------------------------------------------------
+   SCENE VIEW — group tabs by how they were opened (a tree)
+
+   Instead of grouping by domain, the scene view reconstructs the chain of
+   tabs you opened from one another. If tab A was opened from a link on tab B,
+   then A is nested under B. A "scene" is one whole tree: a root tab plus
+   every tab descended from it — the set of pages you opened while working on
+   one thing, regardless of which sites they live on.
+
+   Data flow:
+   - openTabs[].openerTabId tells us each tab's parent (or undefined = root)
+   - buildTabForest() turns that flat list into an array of tree roots
+   - tabs with no usable parent and no children fall back into a single
+     "Uncategorized" group, sorted by domain so old/standalone tabs stay tidy
+   ---------------------------------------------------------------- */
+
+/**
+ * buildTabForest(tabs)
+ *
+ * Turns a flat list of tabs into a forest (array of root nodes) using the
+ * parent/child openerTabId relationships.
+ *
+ * Returns { trees, loners }:
+ *   - trees:  array of root nodes that actually have descendants (real scenes)
+ *   - loners: tabs that are neither a parent nor a child — standalone pages
+ *             that fall back to the "Uncategorized" group.
+ *
+ * Each node is shaped: { tab, children: Node[] }.
+ */
+function buildTabForest(tabs) {
+  // Index tabs by id and prepare a node for each
+  const nodeById = new Map();
+  for (const tab of tabs) {
+    nodeById.set(tab.id, { tab, children: [] });
+  }
+
+  const childIds = new Set();
+  const parentIds = new Set();
+
+  // Wire up children to parents. A parent only counts if it's still open
+  // (present in nodeById) — otherwise the child becomes a root of its own.
+  for (const tab of tabs) {
+    const parentId = tab.openerTabId;
+    const parentNode = typeof parentId === 'number' ? nodeById.get(parentId) : undefined;
+    if (parentNode && parentNode.tab.id !== tab.id) {
+      parentNode.children.push(nodeById.get(tab.id));
+      childIds.add(tab.id);
+      parentIds.add(parentId);
+    }
+  }
+
+  const trees = [];
+  const loners = [];
+
+  for (const tab of tabs) {
+    const isChild = childIds.has(tab.id);
+    if (isChild) continue; // not a root — it lives under its parent
+
+    const node = nodeById.get(tab.id);
+    const hasChildren = node.children.length > 0;
+    if (hasChildren) {
+      trees.push(node); // a real scene: root + descendants
+    } else {
+      loners.push(tab); // standalone tab → Uncategorized fallback
+    }
+  }
+
+  // Keep scenes stable and meaningful: biggest scenes (most tabs) first
+  trees.sort((a, b) => countNodes(b) - countNodes(a));
+
+  return { trees, loners };
+}
+
+/**
+ * countNodes(node)
+ *
+ * Counts how many tabs are in a tree (the node plus all descendants).
+ */
+function countNodes(node) {
+  let total = 1;
+  for (const child of node.children) total += countNodes(child);
+  return total;
+}
+
+/**
+ * collectTreeTabIds(node)
+ *
+ * Returns every tab id in a tree — used to close a whole scene at once.
+ */
+function collectTreeTabIds(node) {
+  const ids = [node.tab.id];
+  for (const child of node.children) ids.push(...collectTreeTabIds(child));
+  return ids;
+}
+
+/**
+ * findNodeById(trees, tabId)
+ *
+ * Depth-first search across a forest for the node whose tab has the given id.
+ * Returns the node, or null if not found.
+ */
+function findNodeById(trees, tabId) {
+  for (const root of trees) {
+    const found = searchNode(root, tabId);
+    if (found) return found;
+  }
+  return null;
+}
+
+/**
+ * searchNode(node, tabId)
+ *
+ * Recursive helper for findNodeById.
+ */
+function searchNode(node, tabId) {
+  if (node.tab.id === tabId) return node;
+  for (const child of node.children) {
+    const found = searchNode(child, tabId);
+    if (found) return found;
+  }
+  return null;
+}
+
+/**
+ * renderSceneRow(node, depth)
+ *
+ * Renders one tab row inside a scene tree, indented by its depth, then
+ * recursively renders its children. depth 0 is the scene root.
+ */
+function renderSceneRow(node, depth) {
+  const tab = node.tab;
+  const safeUrl = (tab.url || '').replace(/"/g, '&quot;');
+
+  let label = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), '');
+  const safeTitle = label.replace(/"/g, '&quot;');
+
+  let domain = '';
+  try { domain = new URL(tab.url).hostname; } catch {}
+  const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=16` : '';
+
+  const hasChildren = node.children.length > 0;
+  const childCount = countNodes(node) - 1;
+
+  // The "close whole scene" button only makes sense on a node with descendants
+  const closeSceneBtn = hasChildren
+    ? `<button class="chip-action scene-close-tree" data-action="close-scene-tree" data-tab-id="${tab.id}" title="Close this tab and all ${childCount} below it">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m20.25 7.5-.625 10.632a2.25 2.25 0 0 1-2.247 2.118H6.622a2.25 2.25 0 0 1-2.247-2.118L3.75 7.5M10 11v6M14 11v6M5.25 7.5h13.5m-9-3h4.5a.75.75 0 0 1 .75.75V7.5h-6V5.25a.75.75 0 0 1 .75-.75Z" /></svg>
+      </button>`
+    : '';
+
+  const childCountBadge = hasChildren
+    ? `<span class="scene-child-count">${childCount}</span>`
+    : '';
+
+  const rowHtml = `
+    <div class="scene-row depth-${Math.min(depth, 6)}" style="--depth:${depth}">
+      <div class="scene-node page-chip clickable" data-action="focus-tab-id" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" title="${safeTitle}">
+        ${depth > 0 ? '<span class="scene-branch" aria-hidden="true"></span>' : ''}
+        ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
+        <span class="chip-text">${label}</span>
+        ${childCountBadge}
+        <div class="chip-actions">
+          <button class="chip-action chip-save" data-action="defer-single-tab" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" title="Save for later">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z" /></svg>
+          </button>
+          <button class="chip-action chip-close" data-action="close-scene-node" data-tab-id="${tab.id}" title="Close just this tab">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
+          </button>
+          ${closeSceneBtn}
+        </div>
+      </div>
+    </div>`;
+
+  const childrenHtml = node.children.map(child => renderSceneRow(child, depth + 1)).join('');
+  return rowHtml + childrenHtml;
+}
+
+/**
+ * renderSceneCard(node)
+ *
+ * Builds one scene card: a tree rooted at `node`, with a header showing the
+ * scene's size and a "close whole scene" action.
+ */
+function renderSceneCard(node) {
+  const tabCount = countNodes(node);
+  const rootTab = node.tab;
+
+  let rootLabel = cleanTitle(smartTitle(stripTitleNoise(rootTab.title || ''), rootTab.url), '');
+  const safeRootLabel = rootLabel.replace(/"/g, '&quot;');
+
+  const treeHtml = renderSceneRow(node, 0);
+
+  return `
+    <div class="mission-card scene-card has-neutral-bar" data-scene-root-id="${rootTab.id}">
+      <div class="status-bar"></div>
+      <div class="mission-content">
+        <div class="mission-top">
+          <span class="mission-name" title="${safeRootLabel}">${rootLabel}</span>
+          <span class="open-tabs-badge">${ICONS.tabs} ${tabCount} tab${tabCount !== 1 ? 's' : ''} in scene</span>
+        </div>
+        <div class="scene-tree">${treeHtml}</div>
+        <div class="actions">
+          <button class="action-btn close-tabs" data-action="close-scene-tree" data-tab-id="${rootTab.id}">
+            ${ICONS.close}
+            Close entire scene (${tabCount} tab${tabCount !== 1 ? 's' : ''})
+          </button>
+        </div>
+      </div>
+      <div class="mission-meta">
+        <div class="mission-page-count">${tabCount}</div>
+        <div class="mission-page-label">tabs</div>
+      </div>
+    </div>`;
+}
+
+/**
+ * renderUncategorizedCard(loners)
+ *
+ * Builds a single fallback card for standalone tabs that have no parent and
+ * no children (e.g. tabs opened before this feature existed). Grouped by
+ * domain inside the card so they stay scannable.
+ */
+function renderUncategorizedCard(loners) {
+  if (!loners || loners.length === 0) return '';
+
+  // Sort loners by domain so same-site tabs sit together
+  const sorted = [...loners].sort((a, b) => {
+    let da = '', db = '';
+    try { da = new URL(a.url).hostname; } catch {}
+    try { db = new URL(b.url).hostname; } catch {}
+    return da.localeCompare(db);
+  });
+
+  const chips = sorted.map(tab => {
+    const safeUrl = (tab.url || '').replace(/"/g, '&quot;');
+    let label = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), '');
+    const safeTitle = label.replace(/"/g, '&quot;');
+    let domain = '';
+    try { domain = new URL(tab.url).hostname; } catch {}
+    const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=16` : '';
+    return `
+      <div class="scene-row depth-0">
+        <div class="scene-node page-chip clickable" data-action="focus-tab-id" data-tab-id="${tab.id}" data-tab-url="${safeUrl}" title="${safeTitle}">
+          ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
+          <span class="chip-text">${label}</span>
+          <div class="chip-actions">
+            <button class="chip-action chip-save" data-action="defer-single-tab" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" title="Save for later">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z" /></svg>
+            </button>
+            <button class="chip-action chip-close" data-action="close-scene-node" data-tab-id="${tab.id}" title="Close just this tab">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
+            </button>
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="mission-card scene-card uncategorized-card has-neutral-bar">
+      <div class="status-bar"></div>
+      <div class="mission-content">
+        <div class="mission-top">
+          <span class="mission-name">Uncategorized</span>
+          <span class="open-tabs-badge">${ICONS.tabs} ${loners.length} tab${loners.length !== 1 ? 's' : ''}</span>
+        </div>
+        <div class="scene-tree">${chips}</div>
+      </div>
+      <div class="mission-meta">
+        <div class="mission-page-count">${loners.length}</div>
+        <div class="mission-page-label">tabs</div>
+      </div>
+    </div>`;
+}
+
+/**
+ * renderSceneView(realTabs)
+ *
+ * Renders the whole scene view into #openTabsMissions: one card per scene
+ * tree, plus a final "Uncategorized" card for standalone tabs.
+ */
+function renderSceneView(realTabs) {
+  const openTabsSection      = document.getElementById('openTabsSection');
+  const openTabsMissionsEl   = document.getElementById('openTabsMissions');
+  const openTabsSectionCount = document.getElementById('openTabsSectionCount');
+  const openTabsSectionTitle = document.getElementById('openTabsSectionTitle');
+  if (!openTabsSection || !openTabsMissionsEl) return;
+
+  const { trees, loners } = buildTabForest(realTabs);
+
+  if (trees.length === 0 && loners.length === 0) {
+    openTabsSection.style.display = 'none';
+    return;
+  }
+
+  if (openTabsSectionTitle) openTabsSectionTitle.textContent = 'Scenes';
+
+  const sceneCount = trees.length + (loners.length > 0 ? 1 : 0);
+  openTabsSectionCount.innerHTML =
+    `${sceneCount} scene${sceneCount !== 1 ? 's' : ''} &nbsp;&middot;&nbsp; ` +
+    `<button class="action-btn close-tabs" data-action="close-all-open-tabs" style="font-size:11px;padding:3px 10px;">${ICONS.close} Close all ${realTabs.length} tabs</button>`;
+
+  const cardsHtml =
+    trees.map(node => renderSceneCard(node)).join('') +
+    renderUncategorizedCard(loners);
+
+  openTabsMissionsEl.innerHTML = cardsHtml;
+  openTabsSection.style.display = 'block';
+}
+
+
+/* ----------------------------------------------------------------
    SAVED FOR LATER — Render Checklist Column
    ---------------------------------------------------------------- */
 
@@ -1208,6 +1634,24 @@ async function renderStaticDashboard() {
   // --- Fetch tabs ---
   await fetchOpenTabs();
   const realTabs = getRealTabs();
+
+  // --- View mode: domain grid vs scene tree ---
+  currentViewMode = await getViewMode();
+  syncViewToggle();
+
+  // Scene view takes a completely different layout, so render it and bail out
+  // of the domain-grouping logic below.
+  if (currentViewMode === VIEW_MODE_SCENE) {
+    renderSceneView(realTabs);
+
+    const statTabsScene = document.getElementById('statTabs');
+    if (statTabsScene) statTabsScene.textContent = openTabs.length;
+
+    checkTabOutDupes();
+    await renderStaleSection();
+    await renderDeferredColumn();
+    return;
+  }
 
   // --- Group tabs by domain ---
   // Landing pages (Gmail inbox, Twitter home, etc.) get their own special group
@@ -1464,6 +1908,70 @@ document.addEventListener('click', async (e) => {
       overflowContainer.style.display = 'contents';
       actionEl.remove();
     }
+    return;
+  }
+
+  // ---- Switch view mode (by domain / by scene) ----
+  if (action === 'set-view-mode') {
+    const mode = actionEl.dataset.viewMode;
+    if (mode && mode !== currentViewMode) {
+      await setViewMode(mode);
+      await renderStaticDashboard();
+    }
+    return;
+  }
+
+  // ---- Focus a specific tab by id (scene view — URLs may be ambiguous) ----
+  if (action === 'focus-tab-id') {
+    const tabId = parseInt(actionEl.dataset.tabId, 10);
+    if (!Number.isNaN(tabId)) await focusTabById(tabId);
+    return;
+  }
+
+  // ---- Scene view: close just this one tab (children get promoted to roots
+  //      automatically because background.js re-parents on removal) ----
+  if (action === 'close-scene-node') {
+    e.stopPropagation();
+    const tabId = parseInt(actionEl.dataset.tabId, 10);
+    if (Number.isNaN(tabId)) return;
+
+    const row = actionEl.closest('.scene-row');
+    if (row) {
+      const rect = row.getBoundingClientRect();
+      shootConfetti(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    }
+
+    await closeTabsByIds([tabId]);
+    playCloseSound();
+    showToast('Tab closed');
+
+    // Re-render so promoted children reflow into the right place
+    await renderStaticDashboard();
+    return;
+  }
+
+  // ---- Scene view: close this tab AND its whole subtree (the entire scene) ----
+  if (action === 'close-scene-tree') {
+    e.stopPropagation();
+    const tabId = parseInt(actionEl.dataset.tabId, 10);
+    if (Number.isNaN(tabId)) return;
+
+    // Rebuild the forest to find the subtree rooted at this tab
+    const { trees } = buildTabForest(getRealTabs());
+    const targetNode = findNodeById(trees, tabId);
+    const idsToClose = targetNode ? collectTreeTabIds(targetNode) : [tabId];
+
+    if (card) {
+      const rect = card.getBoundingClientRect();
+      shootConfetti(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      animateCardOut(card);
+    }
+
+    await closeTabsByIds(idsToClose);
+    playCloseSound();
+    showToast(`Closed scene (${idsToClose.length} tab${idsToClose.length !== 1 ? 's' : ''})`);
+
+    await renderStaticDashboard();
     return;
   }
 
